@@ -144,7 +144,9 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	return Ready{
+
+	}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
