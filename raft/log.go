@@ -22,6 +22,7 @@ import (
 )
 
 var ErrLogIdxOutBoundary = errors.New("raft: logIdx is out of boundary. ")
+var ErrLogIdxAlreadyCompacted = errors.New("raft: logIdx you want has been compacted. ")
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -70,7 +71,6 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	rLog := new(RaftLog)
 	rLog.storage = storage
-	rLog.entries = make([]pb.Entry, 1)
 	firstIdx, err := storage.FirstIndex()
 	if err != nil {
 		log.Error(err)
@@ -103,77 +103,105 @@ func newLog(storage Storage) *RaftLog {
 		rLog.entries = append(rLog.entries, ents...)
 		// change stable pointer
 		rLog.stabled = rLog.LastIndex()
-		// the entry[0] will be used like offset, so does initIdx and initTerm,
-		// they should be updated at the same time
-		rLog.entries[0].Index = rLog.initIdx
-		rLog.entries[0].Term = rLog.initTerm
 	}
-
 	return rLog
 }
 
-
 func (l *RaftLog) leaderAppendNoopLog(term uint64) {
-	l.leaderAppendLogEntry(term, nil)
+	l.leaderAppendLogEntry(term, []*pb.Entry{{Data: nil}}...)
 }
 
 // append log to entries
-func (l *RaftLog) leaderAppendLogEntry(term uint64, data []byte){
+func (l *RaftLog) leaderAppendLogEntry(term uint64, entries ...*pb.Entry) {
 	l.Lock()
 	defer l.Unlock()
-	l.entries = append(l.entries, pb.Entry{
-		Term:  term,
-		Index: l.LastIndex() + 1,
-		Data:  data,
-	})
+	for _, v := range entries {
+		l.entries = append(l.entries, pb.Entry{
+			Term:  term,
+			Index: l.LastIndex() + 1,
+			Data:  v.Data,
+		})
+	}
 }
 
-
-func (l *RaftLog) followerUpdateCommitted (leaderCommitted uint64) {
-	l.committed = max(leaderCommitted, l.LastIndex())
+func (l *RaftLog) followerUpdateCommitted(leaderCommitted uint64, lastNewLogIdx uint64) {
+	l.committed = min(leaderCommitted, lastNewLogIdx)
 }
 
-func (l *RaftLog) leaderUpdateCommitted (N uint64) {
+func (l *RaftLog) leaderUpdateCommitted(N uint64) {
 	l.committed = N
 }
 
-func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, preLogTerm uint64, leaderCommitted uint64) (accept bool, err error){
+// return whether accept the entries
+// index is the last index after appended the entries
+func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, preLogTerm uint64) (accept bool, lastLogIndex uint64) {
 	l.Lock()
 	defer l.Unlock()
-	// if the preIdx is 0, means the log should all append
-	if preLogIdx == 0 {
-		l.entries = l.entries[:1]
-		l.entries = append(l.entries, entries...)
-		return true, nil
-	}
-	lastEntryIdx := l.LastEntriesIndex()
 	accept = false
-	for i := lastEntryIdx; i >= 0; i-- {
-		// found the preLogIdx
-		if preLogIdx == l.entries[i].Index {
-			accept = true
-			// check the preLogTerm
-			var logTerm uint64
-			if logTerm, err = l.Term(l.entries[i].Index); err != nil {
-				return false, err
-			}
-			if logTerm != preLogTerm {
-				// if the term not equal
-				// delete this entry and all followed
-				l.entries = l.entries[:l.entries[i].Index]
-				// update stable
-				l.stabled = min(l.EntryIdx2LogIdx(i - 1), l.stabled)
-				log.Infof("Log with same idx [ %d ] has different term [ %d ]", preLogIdx, logTerm)
-			}
-			l.entries = append(l.entries, entries...)
-			log.Info("append log successfully")
-			// change commit pointer
-			l.followerUpdateCommitted(leaderCommitted)
-			break
+	var startEntryIdx uint64
+	// check whether the preLogIndex is existed
+	if preLogIdx > l.LastIndex() || preLogIdx < l.initIdx {
+		// when preLogIdx > lastLogIdx, return false, leader should resend append entry msg with smaller preIdx
+		// when preLogIdx < initIdx, means the preLogIdx is compacted, means this append msg can be discard
+		log.Debug("preLogIndex > lastIndex, discard append entries.")
+		return false, l.LastIndex()
+	}
+	// if the preLogIdx == initIdx, we start append from entries index 0
+	if preLogIdx == l.initIdx {
+		if preLogTerm == l.initTerm {
+			startEntryIdx = 0
+		}else {
+			return false, l.LastIndex()
 		}
+	} else {
+		preEntryIdx := l.LogIdx2EntryIdx(preLogIdx)
+		// the term of preLogIdx does not match
+		if l.entries[preEntryIdx].Index != preLogIdx || l.entries[preEntryIdx].Term != preLogTerm {
+			return false, l.LastIndex()
+		}
+		startEntryIdx = preEntryIdx + 1
+	}
+
+	// when no append entries
+	// only need to update committed
+	if len(entries) == 0 {
+		return true, preLogIdx
+	}
+	// start find conflict and append entries
+	if startEntryIdx == l.LastEntriesIndex()+1 || l.isEmptyEntries() {
+		// when the append entries start one next of the LastLogEntry
+		l.entries = append(l.entries, entries...)
+	} else {
+		// careful with the conflict entry
+		// start check from startEntryIdx
+		appendEntsIdx := 0
+		selfEntsIdx := startEntryIdx
+		selfLength:=uint64(len(l.entries))
+		appended:=false
+		for selfEntsIdx < selfLength && appendEntsIdx < len(entries) {
+			selfEntry:=l.entries[selfEntsIdx]
+			appendEntry:=entries[appendEntsIdx]
+			if selfEntry.Index == appendEntry.Index && selfEntry.Term == appendEntry.Term {
+				selfEntsIdx++
+				appendEntsIdx++
+			}else{
+				// not include selfEntsIdx
+				l.entries = append(l.entries[:selfEntsIdx], entries[appendEntsIdx:]...)
+				// update stable
+				l.stabled = min(l.EntryIdx2LogIdx(selfEntsIdx - 1), l.stabled)
+				appended = true
+				break
+			}
+		}
+		// if the length of append entries longer than l.entries
+		if !appended && appendEntsIdx < len(entries) {
+			l.entries = append(l.entries, entries[appendEntsIdx:]...)
+		}
+		// update committed
+		log.Debug("append log successfully : ", entries)
 	}
 	// if the accept is false, the commit will be ignored
-	return accept,nil
+	return true, l.LastIndex()
 }
 
 // We need to compact the log entries in some point of time like
@@ -183,14 +211,14 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
-func (l *RaftLog) logsNeeded(next uint64) (ents []pb.Entry) {
+func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry) {
 	l.Lock()
 	defer l.Unlock()
 	lastIdx := l.LastIndex()
 	if next > lastIdx {
 		return []pb.Entry{}
 	}
-	if next < 1{
+	if next <= l.initIdx {
 		return []pb.Entry{}
 	}
 	entryIdx := l.LogIdx2EntryIdx(next)
@@ -212,9 +240,9 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	l.Lock()
 	defer l.Unlock()
-	appliedEntsIdx:=l.LogIdx2EntryIdx(l.applied)
-	committedEntsIDx:=l.LogIdx2EntryIdx(l.committed)
-	ents = l.entries[appliedEntsIdx+1 : committedEntsIDx+1]
+	appliedEntsIdx := l.LogIdx2EntryIdx(l.applied)
+	committedEntsIdx := l.LogIdx2EntryIdx(l.committed)
+	ents = l.entries[appliedEntsIdx+1 : committedEntsIdx+1]
 	return
 }
 
@@ -222,34 +250,41 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	i := len(l.entries) - 1
+	if i < 0 {
+		return l.initIdx
+	}
 	return l.entries[i].Index
 }
 
 func (l *RaftLog) LastEntriesIndex() uint64 {
+	if l.isEmptyEntries() {
+		return 0
+	}
 	return uint64(len(l.entries) - 1)
 }
 
-func (l *RaftLog) EntryIdx2LogIdx(eIdx uint64) uint64{
-	return eIdx + l.initIdx
+func (l *RaftLog) EntryIdx2LogIdx(eIdx uint64) uint64 {
+	return eIdx + l.initIdx + 1
 }
 
+func (l *RaftLog) isEmptyEntries() bool {
+	return len(l.entries) == 0
+}
+
+// should check the binary before use it
 func (l *RaftLog) LogIdx2EntryIdx(logIdx uint64) uint64 {
-	if logIdx < l.initIdx {
-		// return entries[0], the log idx before that is already compacted
-		return 0
-	}
-	if logIdx - l.initIdx > l.LastEntriesIndex() {
-		return l.LastEntriesIndex()
-	}
-	return logIdx - l.initIdx
+	return logIdx - l.initIdx - 1
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	if i < 1 || i > l.LastIndex() {
+	if i < l.initIdx || i > l.LastIndex() {
 		return 0, ErrLogIdxOutBoundary
 	}
-	entsIdx := l.LogIdx2EntryIdx(i)
-	return l.entries[entsIdx].Term, nil
+	if i == l.initIdx {
+		return l.initTerm, nil
+	}
+	idx := l.LogIdx2EntryIdx(i)
+	return l.entries[idx].Term, nil
 }

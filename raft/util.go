@@ -139,3 +139,7 @@ func GetRandomBetween(min, max int) int {
 	}
 	return rand.Intn(max-min) + min
 }
+
+func Majority(num uint64) uint64{
+	return (num / 2) + 1
+}
