@@ -194,6 +194,7 @@ func newRaft(c *Config) *Raft {
 	}
 	r.Term = hardState.Term
 	r.Vote = hardState.Vote
+	r.RaftLog.committed = hardState.Commit
 	// restore conf
 	var ps []uint64
 	if len(c.peers) == 0 && len(confState.Nodes) != 0 {
@@ -210,6 +211,14 @@ func newRaft(c *Config) *Raft {
 		r.votes[v] = false
 	}
 	return r
+}
+
+func (r *Raft) currentHardState() pb.HardState{
+	return pb.HardState{
+		Term:                 r.Term,
+		Vote:                 r.Vote,
+		Commit:               r.RaftLog.committed,
+	}
 }
 
 // sendAppendToAll will send AppendEntry RPC to all followers

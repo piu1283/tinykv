@@ -16,7 +16,6 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -71,12 +70,18 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	lastHardState pb.HardState
+	// only the ready() and advance() will modify it.
+	ready bool
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	rn:=new(RawNode)
+	rn.Raft = newRaft(config)
+	rn.lastHardState = rn.Raft.currentHardState()
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -144,21 +149,47 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
+	rn.ready = false
+	// check whether hardState has been modified
+	currentHardState := rn.Raft.currentHardState()
+	equal := isHardStateEqual(rn.lastHardState, currentHardState)
+	var hs pb.HardState
+	if equal {
+		// if not been modified, there is no need to save it
+		hs = pb.HardState{}
+	} else{
+		// if changed, put it to ready, and replace the lastHardState with currentHardState
+		hs = currentHardState
+		rn.lastHardState = currentHardState
+	}
 	return Ready{
-
+		Messages: rn.Raft.msgs,
+		HardState: hs,
+		Entries: rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 	}
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	return false
+	return rn.ready
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	// change the applied, stable pointer according to the Ready
+	// stable
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries) - 1].Index
+	}
+	// applied
+	if len(rd.CommittedEntries) > 0 && rn.Raft.RaftLog.committed != 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries) - 1].Index
+	}
+	// TODO  call "rn.ready = true" after save progress int the last Ready results
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
