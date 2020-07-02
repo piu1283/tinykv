@@ -313,9 +313,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) error {
 		r.Lead = m.From
 		accept, lastIdx := r.RaftLog.followerTryAppendLog(appendEntries, preLogIdx, preLogTerm)
 		if accept {
-			log.Debugf("node <%d> append log successfully, lastIdx: [%d], originalCommitted:[%d]", r.id, lastIdx, r.RaftLog.committed)
 			r.RaftLog.followerUpdateCommitted(leaderCommitted, lastIdx)
-			log.Debugf("follower [%d] update committed, LeaderCommitted:[%d],lastIdx:[%d]", r.id, leaderCommitted, lastIdx)
 		}
 		r.sendAppendResponse(to, r.Term, lastIdx, accept)
 	}

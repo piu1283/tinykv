@@ -82,17 +82,6 @@ func newLog(storage Storage) *RaftLog {
 		log.Error(err)
 		return nil
 	}
-	// the log is init from scratch
-	// firstIdx will be RAFT_INIT_LOG_INDEX+1 if there is no entry in storage
-	// lastIdx will be RAFT_INIT_LOG_INDEX if there if no entry in storage
-	//if firstIdx > lastIdx {
-	//	rLog.initIdx = lastIdx
-	//	if rLog.initTerm,err = storage.Term(lastIdx); err != nil {
-	//		log.Errorf("%s",err.Error())
-	//		return nil
-	//	}
-	//	rLog.stabled = rLog.LastIndex()
-	//} else {
 	// if log is recovered from storage
 	rLog.initIdx = firstIdx - 1
 	rLog.initTerm, err = storage.Term(rLog.initIdx)
@@ -108,7 +97,6 @@ func newLog(storage Storage) *RaftLog {
 	rLog.entries = append(rLog.entries, ents...)
 	// change stable pointer
 	rLog.stabled = rLog.LastIndex()
-	//}
 	return rLog
 }
 
