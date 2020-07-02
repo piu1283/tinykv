@@ -43,6 +43,54 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	// check whether is ready
+	if d.RaftGroup.HasReady() {
+		// get the ready information
+		ready := d.RaftGroup.Ready()
+		_, err := d.peerStorage.SaveReadyState(&ready)
+		if err != nil {
+			log.Error("fail to save ready state. ", err)
+			return
+		}
+		outBoundMsgs := ready.Messages
+		// send all message out
+		d.Send(d.ctx.trans, outBoundMsgs)
+		// apply committed entries
+		committedEntries := ready.CommittedEntries
+		for _, v := range committedEntries {
+			if len(v.Data) == 0 {
+				log.Debug("applied empty entry.", v)
+				continue
+			}
+			req := raft_cmdpb.RaftCmdRequest{}
+			if err := req.Unmarshal(v.Data); err != nil {
+				return
+			}
+			// leader needs response, follower only need to apply the modification
+			responses, txn, err := d.peerStorage.applyCmdRequest(&req, v.Index, d.IsLeader())
+			if err != nil || responses == nil {
+				log.Error("fail to apply entry. ", err, v)
+				return
+			}
+			// if the idx=-1, that means this entry was not proposed in this peer, so should not update proposals
+			if d.IsLeader() {
+				idx := d.peer.getProposalPositionByIdxAndTerm(v.Index, v.Term)
+				if idx >= 0 {
+					// txn maybe nil, it will has value only if request contains snapGet
+					d.proposals[idx].cb.Txn = txn
+					d.proposals[idx].cb.Done(responses)
+					// TODO see if it can work without getProposalPositionByIdxAndTerm func, just get it by sequence
+					// remove idx
+					d.proposals = d.proposals[1:]
+					//d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
+				}
+			}
+		}
+
+		d.RaftGroup.Advance(ready)
+		// TODO is this a good idea to set readyState here?
+		d.RaftGroup.ReadyState = true
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -108,12 +156,30 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 }
 
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// needs to check whether to propose this request
+	// 1. if this peer is not leader(NOT_LEADER)
+	// 2. if the request term is behind curTerm(STALE_COMMAND)
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
 		cb.Done(ErrResp(err))
 		return
 	}
 	// Your Code Here (2B).
+	if data, err := msg.Marshal(); err != nil {
+		log.Panic("Fail to marshal msg.", msg, err)
+		panic(err)
+	} else {
+		if err := d.RaftGroup.Propose(data); err != nil {
+			log.Error("Fail to propose msg.", msg, err)
+		}
+		propo := &proposal{
+			index: d.lastIndexOfProposal(),
+			term:  d.Term(),
+			cb:    cb,
+		}
+		d.proposals = append(d.proposals, propo)
+		log.Debugf("proposals on [%d]: <%s>", d.PeerId(), propo)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {

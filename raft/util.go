@@ -50,6 +50,12 @@ func IsEmptyHardState(st pb.HardState) bool {
 	return isHardStateEqual(st, pb.HardState{})
 }
 
+func CopyHardState(from, to *pb.HardState) {
+	to.Term = from.Term
+	to.Vote = from.Vote
+	to.Commit = from.Commit
+}
+
 // IsEmptySnap returns true if the given Snapshot is empty.
 func IsEmptySnap(sp *pb.Snapshot) bool {
 	if sp == nil || sp.Metadata == nil {

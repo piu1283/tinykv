@@ -3,6 +3,7 @@ package raftstore
 import (
 	"bytes"
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	"time"
 
 	"github.com/Connor1996/badger"
@@ -308,6 +309,37 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	// save log
+	for i := range entries {
+		// make log key
+		key := meta.RaftLogKey(ps.region.Id, entries[i].Index)
+		_ = raftWB.SetMeta(key, &entries[i])
+	}
+	// update raftLocalState
+	if len(entries) > 0 {
+		lastAppendEntry := entries[len(entries)-1]
+		// log Idx greater than last entry in "entries" will never be committed
+		// Let's consider two situations:
+		// 1. this peer is leader, its log will be the the most correct one.
+		//    (in raftDB [committed..stable]) idx: 5,6,7,8
+		//    (ready.entries) idx: 9,10,11,12,13
+		// 	  res-> (in raftDB [committed..stable]) idx: 5,6,7,8,9,10,11,12,13
+		// 2. this peer is a follower, its log different with the leader's since the idx 6.
+		//    (in raftDB [committed..stable]) idx: 5,6,7,8,9
+		//    (ready.entries) idx: 6,7
+		// 	  res-> (in raftDB [committed..stable]) idx: 5,6,7 (8,9 will never be committed, so delete them)
+		lastStoredIndex, err := ps.LastIndex()
+		if err != nil {
+			return err
+		}
+		for i := lastAppendEntry.Index + 1; i <= lastStoredIndex; i++ {
+			deleteKey := meta.RaftLogKey(ps.region.Id, i)
+			raftWB.DeleteMeta(deleteKey)
+		}
+		// update last log index in raftDB
+		ps.raftState.LastIndex = lastAppendEntry.Index
+		ps.raftState.LastTerm = lastAppendEntry.Term
+	}
 	return nil
 }
 
@@ -331,7 +363,98 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	// some staff in this function might be empty, due to they have no need to update
+	hardState := ready.HardState
+	entriesNeededStabled := ready.Entries
+	raftWB := &engine_util.WriteBatch{}
+	// append unstable logs
+	if err := ps.Append(entriesNeededStabled, raftWB); err != nil {
+		// TODO change the return in 2C
+		return nil, err
+	}
+	// update hardState
+	if !raft.IsEmptyHardState(hardState) {
+		// update hardState in ps
+		raft.CopyHardState(&hardState, ps.raftState.HardState)
+	}
+	// update raftState,
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	// execute the write of raftDB
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		log.Errorf("Fail to write raft data to RaftDB, regionId(%d).", ps.region.Id)
+		return nil, err
+	}
+	// TODO 2C
 	return nil, nil
+}
+
+// process & apply committed request
+func (ps *PeerStorage) applyCmdRequest(cmdRequest *raft_cmdpb.RaftCmdRequest, lastIdxWillApplied uint64, needResponse bool) (*raft_cmdpb.RaftCmdResponse, *badger.Txn, error) {
+	var txn *badger.Txn
+	resps := []*raft_cmdpb.Response{}
+	respHeader := new(raft_cmdpb.RaftResponseHeader)
+	// should contains all the put&delete modification, and also the appliedState modification
+	kvWB := engine_util.WriteBatch{}
+	// TODO whether should use Txn to read
+	for _, req := range cmdRequest.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			// only leader needs to execute get, followers can just advance by moving applied forward
+			if needResponse {
+				getReq := req.Get
+				val, err := engine_util.GetCF(ps.Engines.Kv, getReq.Cf, getReq.Key)
+				if err != nil {
+					return nil, nil, err
+				}
+				resps = append(resps, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				})
+			}
+		case raft_cmdpb.CmdType_Put:
+			putReq := req.Put
+			kvWB.SetCF(putReq.Cf, putReq.Key, putReq.Value)
+			if needResponse {
+				resps = append(resps, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
+			}
+		case raft_cmdpb.CmdType_Delete:
+			delReq := req.Delete
+			kvWB.DeleteCF(delReq.Cf, delReq.Key)
+			if needResponse {
+				resps = append(resps, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+			}
+		case raft_cmdpb.CmdType_Snap:
+			resps = append(resps, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Snap,
+				Snap: &raft_cmdpb.SnapResponse{
+					Region: ps.region,
+				},
+			})
+			txn = ps.Engines.Kv.NewTransaction(false)
+		}
+	}
+	applyStateKey := meta.ApplyStateKey(ps.region.Id)
+	ps.applyState.AppliedIndex = lastIdxWillApplied
+	// TODO maybe need update appliedIndex
+	if err := kvWB.SetMeta(applyStateKey, ps.applyState); err != nil {
+		return nil, nil, err
+	}
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, nil, err
+	}
+	// responses
+	cmdResponse := new(raft_cmdpb.RaftCmdResponse)
+	cmdResponse.Header = respHeader
+	cmdResponse.Responses = resps
+	return cmdResponse, txn, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math"
 	"sync"
 )
 
@@ -82,28 +83,32 @@ func newLog(storage Storage) *RaftLog {
 		return nil
 	}
 	// the log is init from scratch
-	// firstIdx will be 1 if there is no entry in storage
-	// lastIdx will be 0 if there if no entry in storage
-	if firstIdx > lastIdx {
-		rLog.initIdx = 0
-		rLog.initTerm = 0
-	} else {
-		// if log is recovered from storage
-		rLog.initIdx = firstIdx - 1
-		rLog.initTerm, err = storage.Term(rLog.initIdx)
-		if err != nil {
-			return nil
-		}
-		// get All stable log from storage
-		ents, err := storage.Entries(firstIdx, lastIdx+1)
-		if err != nil {
-			panic(err)
-		}
-		// restore all stable log entries to raftLog entries
-		rLog.entries = append(rLog.entries, ents...)
-		// change stable pointer
-		rLog.stabled = rLog.LastIndex()
+	// firstIdx will be RAFT_INIT_LOG_INDEX+1 if there is no entry in storage
+	// lastIdx will be RAFT_INIT_LOG_INDEX if there if no entry in storage
+	//if firstIdx > lastIdx {
+	//	rLog.initIdx = lastIdx
+	//	if rLog.initTerm,err = storage.Term(lastIdx); err != nil {
+	//		log.Errorf("%s",err.Error())
+	//		return nil
+	//	}
+	//	rLog.stabled = rLog.LastIndex()
+	//} else {
+	// if log is recovered from storage
+	rLog.initIdx = firstIdx - 1
+	rLog.initTerm, err = storage.Term(rLog.initIdx)
+	if err != nil {
+		return nil
 	}
+	// get All stable log from storage
+	ents, err := storage.Entries(firstIdx, lastIdx+1)
+	if err != nil {
+		panic(err)
+	}
+	// restore all stable log entries to raftLog entries
+	rLog.entries = append(rLog.entries, ents...)
+	// change stable pointer
+	rLog.stabled = rLog.LastIndex()
+	//}
 	return rLog
 }
 
@@ -116,6 +121,7 @@ func (l *RaftLog) leaderAppendLogEntry(term uint64, entries ...*pb.Entry) {
 	l.Lock()
 	defer l.Unlock()
 	for _, v := range entries {
+		log.Debugf("leader append : [%d] entries", l.LastIndex()+1)
 		l.entries = append(l.entries, pb.Entry{
 			Term:  term,
 			Index: l.LastIndex() + 1,
@@ -125,7 +131,9 @@ func (l *RaftLog) leaderAppendLogEntry(term uint64, entries ...*pb.Entry) {
 }
 
 func (l *RaftLog) followerUpdateCommitted(leaderCommitted uint64, lastNewLogIdx uint64) {
-	l.committed = min(leaderCommitted, lastNewLogIdx)
+	if leaderCommitted > l.committed {
+		l.committed = min(leaderCommitted, lastNewLogIdx)
+	}
 }
 
 func (l *RaftLog) leaderUpdateCommitted(N uint64) {
@@ -150,11 +158,12 @@ func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, pre
 	if preLogIdx == l.initIdx {
 		if preLogTerm == l.initTerm {
 			startEntryIdx = 0
-		}else {
+		} else {
 			return false, l.LastIndex()
 		}
 	} else {
-		preEntryIdx := l.LogIdx2EntryIdx(preLogIdx)
+		// we eliminate the possibility that the preLogIdx < initIdx
+		preEntryIdx, _ := l.LogIdx2EntryIdx(preLogIdx)
 		// the term of preLogIdx does not match
 		if l.entries[preEntryIdx].Index != preLogIdx || l.entries[preEntryIdx].Term != preLogTerm {
 			return false, l.LastIndex()
@@ -176,19 +185,19 @@ func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, pre
 		// start check from startEntryIdx
 		appendEntsIdx := 0
 		selfEntsIdx := startEntryIdx
-		selfLength:=uint64(len(l.entries))
-		appended:=false
+		selfLength := uint64(len(l.entries))
+		appended := false
 		for selfEntsIdx < selfLength && appendEntsIdx < len(entries) {
-			selfEntry:=l.entries[selfEntsIdx]
-			appendEntry:=entries[appendEntsIdx]
+			selfEntry := l.entries[selfEntsIdx]
+			appendEntry := entries[appendEntsIdx]
 			if selfEntry.Index == appendEntry.Index && selfEntry.Term == appendEntry.Term {
 				selfEntsIdx++
 				appendEntsIdx++
-			}else{
+			} else {
 				// not include selfEntsIdx
 				l.entries = append(l.entries[:selfEntsIdx], entries[appendEntsIdx:]...)
 				// update stable
-				l.stabled = min(l.EntryIdx2LogIdx(selfEntsIdx - 1), l.stabled)
+				l.stabled = min(l.EntryIdx2LogIdx(selfEntsIdx-1), l.stabled)
 				appended = true
 				break
 			}
@@ -197,8 +206,6 @@ func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, pre
 		if !appended && appendEntsIdx < len(entries) {
 			l.entries = append(l.entries, entries[appendEntsIdx:]...)
 		}
-		// update committed
-		log.Debug("append log successfully : ", entries)
 	}
 	// if the accept is false, the commit will be ignored
 	return true, l.LastIndex()
@@ -221,7 +228,8 @@ func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry) {
 	if next <= l.initIdx {
 		return []pb.Entry{}
 	}
-	entryIdx := l.LogIdx2EntryIdx(next)
+	entryIdx, _ := l.LogIdx2EntryIdx(next)
+	//log.Debug("l.entries: ",l.entries)
 	return l.entries[entryIdx:]
 }
 
@@ -230,7 +238,10 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
 	l.Lock()
 	defer l.Unlock()
-	entryIdx := l.LogIdx2EntryIdx(l.stabled)
+	entryIdx, compacted := l.LogIdx2EntryIdx(l.stabled)
+	if compacted {
+		return []pb.Entry{}
+	}
 	res := l.entries[entryIdx+1:]
 	return res
 }
@@ -240,8 +251,9 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	l.Lock()
 	defer l.Unlock()
-	appliedEntsIdx := l.LogIdx2EntryIdx(l.applied)
-	committedEntsIdx := l.LogIdx2EntryIdx(l.committed)
+	// we do not need to worry about compacted, the appliedEntsIdx + 1 will be [0, appliedEntsIdx + 1]
+	appliedEntsIdx, _ := l.LogIdx2EntryIdx(l.applied)
+	committedEntsIdx, _ := l.LogIdx2EntryIdx(l.committed)
 	ents = l.entries[appliedEntsIdx+1 : committedEntsIdx+1]
 	return
 }
@@ -272,8 +284,14 @@ func (l *RaftLog) isEmptyEntries() bool {
 }
 
 // should check the binary before use it
-func (l *RaftLog) LogIdx2EntryIdx(logIdx uint64) uint64 {
-	return logIdx - l.initIdx - 1
+func (l *RaftLog) LogIdx2EntryIdx(logIdx uint64) (uint64, bool) {
+	if logIdx < l.initIdx {
+		// The reason return maxUint64 is to indicate that the logIdx you want to convert has already been compacted
+		// so in other function, the maxUint64 + 1 will be 0
+		// it will not cause any trouble if you do not use appliedEntryIndex to do something without + 1
+		return math.MaxUint64, true
+	}
+	return logIdx - l.initIdx - 1, false
 }
 
 // Term return the term of the entry in the given index
@@ -285,6 +303,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	if i == l.initIdx {
 		return l.initTerm, nil
 	}
-	idx := l.LogIdx2EntryIdx(i)
+	idx, _ := l.LogIdx2EntryIdx(i)
 	return l.entries[idx].Term, nil
 }

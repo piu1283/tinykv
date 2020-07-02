@@ -184,6 +184,19 @@ func (p *peer) nextProposalIndex() uint64 {
 	return p.RaftGroup.Raft.RaftLog.LastIndex() + 1
 }
 
+func (p *peer) lastIndexOfProposal() uint64 {
+	return p.RaftGroup.Raft.RaftLog.LastIndex()
+}
+
+func (p *peer) getProposalPositionByIdxAndTerm(idx, term uint64) int {
+	for i,v:=range p.proposals {
+		if v.index == idx && v.term == term {
+			return i
+		}
+	}
+	return -1
+}
+
 /// Tries to destroy itself. Returns a job (if needed) to do more cleaning tasks.
 func (p *peer) MaybeDestroy() bool {
 	if p.stopped {

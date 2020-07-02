@@ -72,7 +72,7 @@ type RawNode struct {
 	// Your Data Here (2A).
 	lastHardState pb.HardState
 	// only the ready() and advance() will modify it.
-	ready bool
+	ReadyState bool
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -81,6 +81,7 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	rn:=new(RawNode)
 	rn.Raft = newRaft(config)
 	rn.lastHardState = rn.Raft.currentHardState()
+	rn.ReadyState = true
 	return rn, nil
 }
 
@@ -97,7 +98,7 @@ func (rn *RawNode) Campaign() error {
 }
 
 // Propose proposes data be appended to the raft log.
-func (rn *RawNode) Propose(data []byte) error {
+func (rn *RawNode) Propose(data []byte) error{
 	ent := pb.Entry{Data: data}
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -149,7 +150,7 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	rn.ready = false
+	rn.ReadyState = false
 	// check whether hardState has been modified
 	currentHardState := rn.Raft.currentHardState()
 	equal := isHardStateEqual(rn.lastHardState, currentHardState)
@@ -157,10 +158,9 @@ func (rn *RawNode) Ready() Ready {
 	if equal {
 		// if not been modified, there is no need to save it
 		hs = pb.HardState{}
-	} else{
+	} else {
 		// if changed, put it to ready, and replace the lastHardState with currentHardState
 		hs = currentHardState
-		rn.lastHardState = currentHardState
 	}
 	return Ready{
 		Messages: rn.Raft.msgs,
@@ -173,7 +173,8 @@ func (rn *RawNode) Ready() Ready {
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
-	return rn.ready
+	// if a ready is currently being processed, if yes, return false, means the raft is not ready
+	return rn.ReadyState
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
@@ -181,6 +182,10 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	// change the applied, stable pointer according to the Ready
+	// hardState
+	if !IsEmptyHardState(rd.HardState) {
+		rn.lastHardState = rd.HardState
+	}
 	// stable
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries) - 1].Index
@@ -189,7 +194,8 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 && rn.Raft.RaftLog.committed != 0 {
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries) - 1].Index
 	}
-	// TODO  call "rn.ready = true" after save progress int the last Ready results
+	// clear the msgs
+	rn.Raft.msgs = rn.Raft.msgs[:0]
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
