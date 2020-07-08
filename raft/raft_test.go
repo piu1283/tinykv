@@ -1030,7 +1030,7 @@ func TestProvideSnap2C(t *testing.T) {
 	sm.readMessages() // clear message
 
 	// force set the next of node 2, so that node 2 needs a snapshot
-	sm.Prs[2].Next = 0
+	sm.Prs[2].Next = 1
 	sm.Step(pb.Message{From: 2, To: 1, Term: 1, MsgType: pb.MessageType_MsgAppendResponse, Index: sm.Prs[2].Next - 1, Reject: true})
 
 	msgs := sm.readMessages()
