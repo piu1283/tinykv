@@ -59,15 +59,19 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		committedEntries := ready.CommittedEntries
 		for _, v := range committedEntries {
 			if len(v.Data) == 0 {
-				log.Debug("applied empty entry.", v)
+				log.Debug("%s applied empty entry.", d.Tag, v)
 				continue
 			}
-			req := raft_cmdpb.RaftCmdRequest{}
+			req := new(raft_cmdpb.RaftCmdRequest)
 			if err := req.Unmarshal(v.Data); err != nil {
 				return
 			}
+			if req.AdminRequest != nil {
+				d.handleAdminRequest(req)
+				continue
+			}
 			// leader needs response, follower only need to apply the modification
-			responses, txn, err := d.peerStorage.applyCmdRequest(&req, v.Index, d.IsLeader())
+			responses, txn, err := d.peerStorage.applyCmdRequest(req, v.Index, d.IsLeader())
 			if err != nil || responses == nil {
 				log.Error("fail to apply entry. ", err, v)
 				return
@@ -81,8 +85,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					d.proposals[idx].cb.Done(responses)
 					// TODO see if it can work without getProposalPositionByIdxAndTerm func, just get it by sequence
 					// remove idx
-					d.proposals = d.proposals[1:]
-					//d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
+					//d.proposals = d.proposals[1:]
+					d.proposals = append(d.proposals[:idx], d.proposals[idx+1:]...)
 				}
 			}
 		}
@@ -90,6 +94,49 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		d.RaftGroup.Advance(ready)
 		// TODO is this a good idea to set readyState here?
 		d.RaftGroup.ReadyState = true
+	}
+}
+
+func (d *peerMsgHandler) handleAdminRequest(req *raft_cmdpb.RaftCmdRequest) {
+	switch req.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		// handle logGCCompact
+		// check whether need to be compacted
+		compactIdx := req.AdminRequest.CompactLog.CompactIndex
+		if d.peerStorage.applyState.TruncatedState.Index >= compactIdx {
+			log.Debugf("the log is already compacted")
+			return
+		}
+		log.Debugf("%s update compacted before, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
+		// update state
+		firstIdx := d.peerStorage.updateMetaByLogCompact(req)
+		// update memory log
+		d.RaftGroup.CompactMemoryLogEntries(req.AdminRequest.CompactLog.CompactIndex, req.AdminRequest.CompactLog.CompactTerm)
+		// assign a asynchronously task
+		d.ctx.raftLogGCTaskSender <- &runner.RaftLogGCTask{
+			RaftEngine: d.peerStorage.Engines.Raft,
+			RegionID:   d.regionId,
+			StartIdx:   firstIdx,
+			EndIdx:     compactIdx + 1,
+		}
+		log.Debugf("%s update compacted, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
+		// TODO seems this variable is useless
+		d.peer.LastCompactedIdx = compactIdx
+		log.Debugf("%s call Snapshot.", d.Tag)
+		snapshot, err := d.peerStorage.Snapshot()
+		if err == nil {
+			// update the LastSnapshot
+			// LastSnapshot only be updated when new snapshot index is greater than previous one
+			d.RaftGroup.UpdateLastSnapshot(&snapshot)
+			// if the generated snapshot is earlier than the compact, regenerating
+			if compactIdx > snapshot.Metadata.Index {
+				log.Debugf("%s call Snapshot.", d.Tag)
+				_, _ = d.peerStorage.Snapshot()
+			}
+		} else {
+			log.Errorf(" %s snapshot is still generating when executing compactLog command.", d.Tag)
+		}
+		log.Debugf("state after")
 	}
 }
 
@@ -171,6 +218,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	} else {
 		if err := d.RaftGroup.Propose(data); err != nil {
 			log.Error("Fail to propose msg.", msg, err)
+		}
+		if msg.AdminRequest != nil {
+			log.Debugf("proposals admin request on [%d]: <%s>", d.PeerId(), msg.AdminRequest.CmdType.String())
+			// admin request has no need to be appended to proposals
+			return
 		}
 		propo := &proposal{
 			index: d.lastIndexOfProposal(),

@@ -61,9 +61,15 @@ type RaftLog struct {
 	// Your Data Here (2A).
 	// mutex used for concurrently change log entries
 	sync.Mutex
-	// initIdx is the idx at position 0,
+	// initIdx equals to the truncated index
 	initIdx  uint64
 	initTerm uint64
+	// It is used for snapshot cache.
+	// When leader needs to send snapshot to follower,
+	// the lastSnapshot will be first considered.
+	// If it do not satisfied the progress of follower, which might be impossible,
+	// the leader will regenerating snapshot
+	lastSnapshot *pb.Snapshot
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -98,6 +104,47 @@ func newLog(storage Storage) *RaftLog {
 	// change stable pointer
 	rLog.stabled = rLog.LastIndex()
 	return rLog
+}
+
+// this function will update initIdx and initTerm and entries according to truncate data
+// If existing log entry has same index and term as snapshot’s last included entry,
+// retain log entries following it and reply
+func (l *RaftLog) checkUpdateAndCompactLog(truncIdx, truncTerm uint64) {
+	l.Lock()
+	defer l.Unlock()
+	truncEntsIdx, compacted := l.LogIdx2EntryIdx(truncIdx)
+	if compacted {
+		return
+	}
+	l.initIdx = truncIdx
+	l.initTerm = truncTerm
+	if truncIdx >= l.LastIndex() {
+		l.entries = l.entries[:0]
+		l.applied = truncIdx
+		l.committed = truncIdx
+		l.stabled = truncIdx
+	} else {
+		storeTerm := l.entries[truncEntsIdx].Term
+		// update initIdx, applied, commit, stable
+		if storeTerm == truncTerm {
+			// if we meet an entry have the same index and term with the trunc, we can save the following entries
+			if truncIdx > l.applied {
+				l.applied = truncIdx
+				if truncIdx > l.committed {
+					l.committed = truncIdx
+					l.stabled = truncIdx
+				}
+			}
+			l.entries = l.entries[truncEntsIdx + 1:]
+			//l.maybeCompact()
+		} else {
+			l.entries = l.entries[:0]
+			l.applied = truncIdx
+			l.committed = truncIdx
+			l.stabled = truncIdx
+		}
+	}
+	log.Debugf("after compacted or snapshot-> [applied: %d],[committed: %d], [stabled: %d],[initIdx: %d],[initTerm: %d]", l.applied, l.committed, l.stabled, l.initIdx, l.initTerm)
 }
 
 func (l *RaftLog) leaderAppendNoopLog(term uint64) {
@@ -204,21 +251,38 @@ func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, pre
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	cutIdx := l.initIdx
+	// if the initIdx is greater than last index, we can delete all the log entries
+	if l.initIdx >= l.LastIndex() {
+		l.entries = l.entries[:0]
+		return
+	}
+	// if not , we need to find the position of initlog, and delete itself and the logs after it
+	entIdx := -1
+	for i, v := range l.entries {
+		if cutIdx == v.Index {
+			entIdx = i
+			break
+		}
+	}
+	l.entries = l.entries[entIdx+1:]
 }
 
-func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry) {
+// get the log entries leader should send to the follower
+// if the compacted = true, means the leader should send snapshot to that follower
+func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry, compacted bool) {
 	l.Lock()
 	defer l.Unlock()
 	lastIdx := l.LastIndex()
 	if next > lastIdx {
-		return []pb.Entry{}
+		return []pb.Entry{}, false
 	}
 	if next <= l.initIdx {
-		return []pb.Entry{}
+		return []pb.Entry{}, true
 	}
 	entryIdx, _ := l.LogIdx2EntryIdx(next)
 	//log.Debug("l.entries: ",l.entries)
-	return l.entries[entryIdx:]
+	return l.entries[entryIdx:], false
 }
 
 // unstableEntries return all the unstable entries
@@ -227,11 +291,10 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 	l.Lock()
 	defer l.Unlock()
 	entryIdx, compacted := l.LogIdx2EntryIdx(l.stabled)
-	if compacted {
-		return []pb.Entry{}
+	if !compacted || l.stabled == l.initIdx {
+		return l.entries[entryIdx+1:]
 	}
-	res := l.entries[entryIdx+1:]
-	return res
+	return []pb.Entry{}
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -272,14 +335,16 @@ func (l *RaftLog) isEmptyEntries() bool {
 }
 
 // should check the binary before use it
+// the second return will indicate whether the request index has been compacted
 func (l *RaftLog) LogIdx2EntryIdx(logIdx uint64) (uint64, bool) {
-	if logIdx < l.initIdx {
+	if logIdx <= l.initIdx {
 		// The reason return maxUint64 is to indicate that the logIdx you want to convert has already been compacted
 		// so in other function, the maxUint64 + 1 will be 0
 		// it will not cause any trouble if you do not use appliedEntryIndex to do something without + 1
 		return math.MaxUint64, true
 	}
-	return logIdx - l.initIdx - 1, false
+	res := logIdx - l.initIdx - 1
+	return res, false
 }
 
 // Term return the term of the entry in the given index

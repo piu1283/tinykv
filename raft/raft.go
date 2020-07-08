@@ -18,6 +18,7 @@ import (
 	"errors"
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"time"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -239,13 +240,6 @@ func (r *Raft) sendAppendToAll() {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	msg := pb.Message{
-		MsgType: pb.MessageType_MsgAppend,
-		To:      to,
-		From:    r.id,
-		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
-	}
 	// send entry according to the progress
 	p := r.Prs[to]
 	if p == nil {
@@ -258,21 +252,80 @@ func (r *Raft) sendAppend(to uint64) bool {
 	} else {
 		preIdx = 0
 	}
+	entsNeeded, compacted := r.RaftLog.logEntriesAfterNext(nxt)
+	var msg *pb.Message
 	var err error
+	if compacted {
+		// send the snapshot msg
+		log.Debugf("%d need to send snapshot. send to %d , nxt:[%d]", r.id, to, nxt)
+		if msg, err = r.sendSnapshotMsg(to, nxt); err != nil {
+			log.Errorf("node %d fail to send snapshot msg: %s", r.id, err)
+			return false
+		}
+	} else {
+		// send normal append entries msg
+		if msg, err = r.sendAppendEntriesMsg(preIdx, to, entsNeeded); err != nil {
+			log.Errorf("node %d fail to send snapshot msg: %s", r.id, err)
+			return false
+		}
+	}
+	r.msgs = append(r.msgs, *msg)
+	return true
+}
+
+func (r *Raft) sendSnapshotMsg(to, nxtIdx uint64) (*pb.Message, error) {
+	// TODO can be change to using goRoutine to accelerated ?
+	// check whether need to generating new snapshot
+	msg := &pb.Message{
+		MsgType: pb.MessageType_MsgSnapshot,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	}
+	// if current cached snapshot not satisfied the requirement
+	if !r.IsLastSnapshotOkForSending(nxtIdx) {
+		for {
+			log.Debugf("%d call Snapshot.", r.id)
+			snapshot, err := r.RaftLog.storage.Snapshot()
+			if err == nil {
+				r.UpdateLastSnapshot(&snapshot)
+				break
+			} else {
+				if err == ErrSnapshotTemporarilyUnavailable {
+					// if the log is not ready, take a break
+					time.Sleep(15 * time.Second)
+					continue
+				} else {
+					// TODO is this a good idea to panic here ?
+					log.Errorf("leader try generated snapshot and fail too many times.")
+					return nil, err
+				}
+			}
+		}
+	}
+	msg.Snapshot = r.GetLastSnapshot()
+	return msg, nil
+}
+
+func (r *Raft) sendAppendEntriesMsg(preIdx, to uint64, entsNeeded []pb.Entry) (*pb.Message, error) {
+	var err error
+	msg := &pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed,
+	}
 	msg.LogTerm, err = r.RaftLog.Term(preIdx)
 	if err != nil {
 		log.Errorf("Fail to get Term of Log Index (%d), Error: %s", preIdx, err.Error())
-		return false
+		return msg, err
 	}
 	msg.Index = preIdx
-	log.Debugf("send nxt[%d] to [%d]", nxt, to)
-	entsNeeded := r.RaftLog.logEntriesAfterNext(nxt)
-	log.Debug("entNeeded: ", entsNeeded)
 	for i := range entsNeeded {
 		msg.Entries = append(msg.Entries, &entsNeeded[i])
 	}
-	r.msgs = append(r.msgs, msg)
-	return true
+	return msg, nil
 }
 
 // construct and send append response msg
@@ -322,13 +375,15 @@ func (r *Raft) handleAppendEntries(m pb.Message) error {
 
 // handleAppendResponse handles the response of the append entry request
 func (r *Raft) handleAppendResponse(m pb.Message) (shouldResend bool) {
-	fId := m.From
+	log.Debugf("message append response from %d to %d, <lastIndex:[%d], reject:[%v]>", m.From, m.To, m.Index, m.Reject)
+	fid := m.From
 	// whether the follower accept the entries
 	accept := !m.Reject
 	// whether the leader need send append again
 	shouldResend = m.Reject
-	pro := r.Prs[fId]
+	pro := r.Prs[fid]
 	followerIdx := m.Index
+	caughtUp := true
 	// if accepted, change the next and match
 	if accept {
 		pro.Match = followerIdx
@@ -347,11 +402,16 @@ func (r *Raft) handleAppendResponse(m pb.Message) (shouldResend bool) {
 			pro.Match = min(pro.Next-1, pro.Match)
 		}
 	}
+	// if the follower is lag behind the leader, the leader should send append entries again
+	// This situation usually happens if the follower just accept the snapshot
+	if pro.Match < r.RaftLog.LastIndex() {
+		caughtUp = false
+	}
 	// update commit according to each follower's progress
 	hasUpdated := r.checkAndUpdateCommitIdx()
-	if hasUpdated {
-		shouldResend = hasUpdated
-	}
+	shouldResend = hasUpdated || !caughtUp || m.Reject
+	log.Debugf("finish process append response from %d to %d, <resend:[%v], prog:[M %d,N %d]>",
+		m.From, m.To, shouldResend, r.Prs[fid].Match, r.Prs[fid].Next)
 	return
 }
 
@@ -413,12 +473,31 @@ func (r *Raft) sendHeartbeatToAll() {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	// TODO to see whether can be removed
+	p := r.Prs[to]
+	if p == nil {
+		return
+	}
+	nxt := p.Next
+	var preIdx uint64
+	if nxt > 0 {
+		preIdx = nxt - 1
+	} else {
+		preIdx = 0
+	}
+	preTerm, err := r.RaftLog.Term(preIdx)
+	if err != nil {
+		log.Errorf("Fail to get Term of Log Index (%d), Error: %s", preIdx, err.Error())
+		preIdx = r.RaftLog.LastIndex()
+		preTerm, _ = r.RaftLog.Term(preIdx)
+	}
+	com := min(p.Match, r.RaftLog.committed)
 	msg := pb.Message{
 		From:    r.id,
 		To:      to,
 		Term:    r.Term,
-		Commit:  r.RaftLog.committed,
+		Commit:  com,
+		Index:   preIdx,
+		LogTerm: preTerm,
 		MsgType: pb.MessageType_MsgHeartbeat,
 	}
 	r.msgs = append(r.msgs, msg)
@@ -602,9 +681,7 @@ func (r *Raft) Step(m pb.Message) error {
 		// check heartBeat timeout
 		switch m.MsgType {
 		case pb.MessageType_MsgHeartbeat:
-			if r.Lead == m.From {
-				r.handleHeartbeat(m)
-			}
+			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgHup:
@@ -612,6 +689,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.becameCandidateAndStartElection()
 		case pb.MessageType_MsgAppend:
 			err = r.handleAppendEntries(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 
 	case StateCandidate:
@@ -657,9 +736,37 @@ func (r *Raft) Step(m pb.Message) error {
 				r.becomeFollower(m.Term, m.From)
 			}
 			err = r.handleAppendEntries(m)
+		case pb.MessageType_MsgHeartbeatResponse:
+			resend := r.handleHeartBeatResponse(m)
+			if resend {
+				r.sendAppend(m.From)
+			}
 		}
 	}
 	return err
+}
+
+func (r *Raft) handleHeartBeatResponse(m pb.Message) (resendAppend bool) {
+	// If the follower reject the heartBeat, and the Term is correct,
+	// which means this follower is lag behind with the leader,
+	// so we should send Append msg to it
+	resendAppend = m.Reject
+	if m.Reject {
+		pro := r.Prs[m.From]
+		followerIdx := m.Index
+		if pro.Next-1 > 0 {
+			// if did not accept, the leader will move "next" one step backward
+			// if the follower lagged too much,to speed up the syn process,
+			// the leader can retry started from the follower's (lastLogIdx + 1)
+			if pro.Next > (followerIdx + 1) {
+				pro.Next = followerIdx + 1
+			} else {
+				pro.Next--
+			}
+			pro.Match = min(pro.Next-1, pro.Match)
+		}
+	}
+	return
 }
 
 // handleVoteResponse handel the response RPC of vote
@@ -754,7 +861,6 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-
 	response := pb.Message{
 		From:    r.id,
 		To:      m.From,
@@ -772,25 +878,99 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		// check and update committed
 		log.Debugf("node %d, originalCommitted:[%d]", r.id, r.RaftLog.committed)
 		// update committed only if leader's is greater than mine
-		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.followerUpdateCommitted(m.Commit, r.RaftLog.LastIndex())
+		accept, lastIndex := r.RaftLog.followerTryAppendLog([]pb.Entry{}, m.Index, m.LogTerm)
+		// should check whether it is keep-up with the leader
+		if accept {
+			if m.Commit > r.RaftLog.committed {
+				r.RaftLog.followerUpdateCommitted(m.Commit, r.RaftLog.LastIndex())
+			}
+			response.Reject = false
+		} else {
+			response.Reject = true
+			response.Index = lastIndex
+			log.Debugf("follower [%d] reject the heartBeat.", r.id)
 		}
-		log.Debugf("follower [%d] update committed, LeaderCommitted:[%d],lastIdx:[%d]", r.id, m.Commit, r.RaftLog.LastIndex())
-		response.Reject = false
+		log.Debugf("follower [%d] update committed, LeaderCommitted:[%d], leaderCommittedTerm:[%d],lastIdx:[%d], result:[%d]",
+			r.id, m.Commit, m.LogTerm, r.RaftLog.LastIndex(), r.RaftLog.committed)
 	}
 	// send response
 	r.msgs = append(r.msgs, response)
 }
 
-//func (r *Raft) handleHeartBeatResponse(m pb.Message) {
-//	if m.Term > r.Term {
-//		r.becomeFollower(r.Term, None)
-//	}
-//}
-
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Term < r.Term {
+		log.Infof("snapshot received by [%d] whose term is stale.", r.id)
+		// TODO how to response, did not find the snapshot response msg, or some chan
+	}
+	snapshot := m.Snapshot
+	// handle the snapshot
+	if snapshot.Metadata.Index < r.RaftLog.committed {
+		log.Debugf("reject snapshot, snapshot index[%d] < committed[%d]", snapshot.Metadata.Index, r.RaftLog.committed)
+		r.sendAppendResponse(m.From, r.Term, r.RaftLog.LastIndex(), false)
+		return
+	}
+	// update leader
+	r.Lead = m.GetFrom()
+	newPrs := make(map[uint64]*Progress)
+	newVotes := make(map[uint64]bool)
+	// copy old member state to new
+	// update r.prs and r.votes
+	for _, v := range snapshot.Metadata.ConfState.Nodes {
+		if r.Prs[v] != nil {
+			newPrs[v] = r.Prs[v]
+		} else {
+			newPrs[v] = &Progress{
+				Match: 0,
+				Next:  r.RaftLog.LastIndex() + 1,
+			}
+		}
+		if val, has := r.votes[v]; has {
+			newVotes[v] = val
+		}
+	}
+	r.Prs = newPrs
+	r.votes = newVotes
+	// update the log entries
+	r.RaftLog.checkUpdateAndCompactLog(snapshot.Metadata.Index, snapshot.Metadata.Term)
+	// put the incoming snapshot in pendingSnapshot
+	// so it can be reflect in the next ready
+	r.setPendingSnapshot(snapshot)
+	r.sendAppendResponse(m.From, r.Term, r.RaftLog.LastIndex(), true)
+}
+
+func (r *Raft) getPendingSnapshot() *pb.Snapshot {
+	return r.RaftLog.pendingSnapshot
+}
+
+func (r *Raft) finishStablePendingSnapshot() {
+	r.RaftLog.pendingSnapshot = nil
+}
+
+func (r *Raft) setPendingSnapshot(snapshot *pb.Snapshot) {
+	r.RaftLog.pendingSnapshot = snapshot
+}
+
+func (r *Raft) GetLastSnapshot() *pb.Snapshot {
+	return r.RaftLog.lastSnapshot
+}
+
+func (r *Raft) UpdateLastSnapshot(snapshot *pb.Snapshot) {
+	if r.RaftLog.lastSnapshot == nil {
+		r.RaftLog.lastSnapshot = snapshot
+		return
+	}
+	if r.RaftLog.lastSnapshot.Metadata.Index < snapshot.Metadata.Index {
+		r.RaftLog.lastSnapshot = snapshot
+	}
+}
+
+func (r *Raft) IsLastSnapshotOkForSending(needLogIdx uint64) bool {
+	if r.RaftLog.lastSnapshot == nil {
+		return false
+	}
+	return r.RaftLog.lastSnapshot.Metadata.Index >= needLogIdx
 }
 
 // addNode add a new node to raft group
