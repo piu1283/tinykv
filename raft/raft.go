@@ -143,7 +143,7 @@ type Raft struct {
 
 	// heartbeat interval, should send
 	heartbeatTimeout int
-	// baseline of election interval, will be set randomly according to configElectionTimeout
+	// baseline of election interval, will be set randomly according to baseElectionTimeout
 	electionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
@@ -167,11 +167,7 @@ type Raft struct {
 	PendingConfIndex uint64
 
 	// back-up the config election time out
-	configElectionTimeout int
-}
-
-func (r *Raft) randElectionTimeout() {
-	r.electionTimeout = GetRandomBetween(r.configElectionTimeout, 2*r.configElectionTimeout)
+	baseElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -181,7 +177,7 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	r := new(Raft)
-	r.configElectionTimeout = c.ElectionTick
+	r.baseElectionTimeout = c.ElectionTick
 	r.heartbeatTimeout = c.HeartbeatTick
 	// set rand election time out
 	r.randElectionTimeout()
@@ -214,12 +210,32 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+// reset the election timeout to a random number
+func (r *Raft) randElectionTimeout() {
+	r.electionTimeout = GetRandomBetween(r.baseElectionTimeout, 2*r.baseElectionTimeout)
+}
+
+// check whether the applied index > pendingConfIndex
+// if true, means this leader can accept new conf change propose
+func (r *Raft) checkPendingConfChangeIdx() bool {
+	return r.RaftLog.applied >= r.PendingConfIndex
+}
+
+// return the current HardState of this raft
 func (r *Raft) currentHardState() pb.HardState {
 	return pb.HardState{
 		Term:   r.Term,
 		Vote:   r.Vote,
 		Commit: r.RaftLog.committed,
 	}
+}
+
+func (r *Raft) getCurrentLeader() uint64 {
+	return r.Lead
+}
+
+func (r *Raft) getCurrentState() StateType {
+	return r.State
 }
 
 // sendAppendToAll will send AppendEntry RPC to all followers
@@ -407,6 +423,20 @@ func (r *Raft) handleAppendResponse(m pb.Message) (shouldResend bool) {
 	if pro.Match < r.RaftLog.LastIndex() {
 		caughtUp = false
 	}
+	// if this response is sent during the time of leader transfer
+	if r.leadTransferee == m.From {
+		// the leader will decide whether to send the timout now msg
+		// according to whether the follower's log is up-to-date
+		if caughtUp {
+			r.sendTimeoutNow(r.leadTransferee)
+			// make sure the leadTransferee is set 0
+			// although we already add this line in cleanState(),
+			// but it does not hurt anything, right?
+			r.leadTransferee = 0
+			return
+		}
+	}
+
 	// update commit according to each follower's progress
 	hasUpdated := r.checkAndUpdateCommitIdx()
 	shouldResend = hasUpdated || !caughtUp || m.Reject
@@ -640,6 +670,10 @@ func (r *Raft) becomeLeader() {
 	})
 }
 
+func (r *Raft) isLeader() bool {
+	return r.State == StateLeader
+}
+
 // this func will append proposed data to leader's log
 func (r *Raft) leaderAppendEntries(entries []*pb.Entry) {
 	r.RaftLog.leaderAppendLogEntry(r.Term, entries...)
@@ -657,15 +691,14 @@ func (r *Raft) cleanProgress() {
 	}
 }
 
+// every time the raftState changed,
+// those state should be reset
 func (r *Raft) cleanState() {
 	r.Vote = 0
 	r.votes = make(map[uint64]bool)
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-}
-
-func (r *Raft) apply(idx uint64) {
-	r.RaftLog.applied = idx
+	r.leadTransferee = 0
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -691,6 +724,16 @@ func (r *Raft) Step(m pb.Message) error {
 			err = r.handleAppendEntries(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			r.handleTimeoutNow(m)
+		case pb.MessageType_MsgTransferLeader:
+			// if the follower receive a transferLeader msg, just forward to the leader
+			// and put its id in the from, means the leadership will transfer to itself.
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgTransferLeader,
+				To:      r.Lead,
+				From:    r.id,
+			})
 		}
 
 	case StateCandidate:
@@ -741,15 +784,83 @@ func (r *Raft) Step(m pb.Message) error {
 			if resend {
 				r.sendAppend(m.From)
 			}
+		case pb.MessageType_MsgTransferLeader:
+			r.handleLeaderTransfer(m)
 		}
 	}
 	return err
+}
+
+func (r *Raft) sendTimeoutNow(to uint64) {
+	timeoutReq := pb.Message{
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		MsgType: pb.MessageType_MsgTimeoutNow,
+	}
+	r.msgs = append(r.msgs, timeoutReq)
+}
+
+// this func will handle timeout now message
+func (r *Raft) handleTimeoutNow(m pb.Message) {
+	// if follower receive this msg,
+	// step a hup msg immediately
+	if m.Term < r.Term {
+		// may no possible, but still ignore
+		return
+	}
+	// check whether I am still a member of this group
+	if !r.checkNodeExist(r.id) {
+		// if not, ignore
+		return
+	}
+	_ = r.Step(pb.Message{
+		MsgType: pb.MessageType_MsgHup,
+	})
+}
+
+// this func will handle MessageType MsgTransferLeader
+func (r *Raft) handleLeaderTransfer(m pb.Message) {
+	// TODO how to stop accepting user request, maybe it is handled in upper application
+	target := m.From
+	// check the whether the node is exist
+	if !r.checkNodeExist(target) {
+		return
+	}
+	// set the transfer target
+	r.leadTransferee = target
+	// check whether this follower's log is up-to-date
+	// 1. we can just use the progress,Match[i]
+	// 2. we can send an append msg to this follower anyway, if we receive
+	// we choose (1) here
+	pro := r.Prs[r.leadTransferee]
+	if pro.Match == r.RaftLog.LastIndex() {
+		// up-to-date
+		// let the chosen one start a new election
+		r.sendTimeoutNow(r.leadTransferee)
+		r.leadTransferee = 0
+	} else {
+		// lag behind
+		// we need to make the chosen one keep up with leader
+		r.sendAppend(r.leadTransferee)
+	}
+}
+
+func (r *Raft) checkNodeExist(id uint64) bool {
+	if _, ok := r.Prs[id]; ok {
+		return true
+	}
+	return false
 }
 
 func (r *Raft) handleHeartBeatResponse(m pb.Message) (resendAppend bool) {
 	// If the follower reject the heartBeat, and the Term is correct,
 	// which means this follower is lag behind with the leader,
 	// so we should send Append msg to it
+	if m.Term < r.Term {
+		// ignore
+		return false
+	}
 	resendAppend = m.Reject
 	if m.Reject {
 		pro := r.Prs[m.From]
@@ -902,7 +1013,8 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
 	if m.Term < r.Term {
 		log.Infof("snapshot received by [%d] whose term is stale.", r.id)
-		// TODO how to response, did not find the snapshot response msg, or some chan
+		// TODO how to response, here we just return
+		return
 	}
 	snapshot := m.Snapshot
 	// handle the snapshot
@@ -976,9 +1088,22 @@ func (r *Raft) IsLastSnapshotOkForSending(needLogIdx uint64) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	// add a new node
+	// change the r.Prs
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	// remove node
+	// 1. remove votes[id]
+	// maybe this is a useless op, I guess
+	delete(r.votes, id)
+	// 2. remove progress
+	delete(r.Prs, id)
+	r.checkAndUpdateCommitIdx()
 }

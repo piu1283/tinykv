@@ -110,8 +110,8 @@ func newLog(storage Storage) *RaftLog {
 // If existing log entry has same index and term as snapshot’s last included entry,
 // retain log entries following it and reply
 func (l *RaftLog) checkUpdateAndCompactLog(truncIdx, truncTerm uint64) {
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	truncEntsIdx, compacted := l.LogIdx2EntryIdx(truncIdx)
 	if compacted {
 		return
@@ -153,11 +153,12 @@ func (l *RaftLog) leaderAppendNoopLog(term uint64) {
 
 // append log to entries
 func (l *RaftLog) leaderAppendLogEntry(term uint64, entries ...*pb.Entry) {
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	for _, v := range entries {
 		log.Debugf("leader append : [%d] entries", l.LastIndex()+1)
 		l.entries = append(l.entries, pb.Entry{
+			EntryType: v.EntryType,
 			Term:  term,
 			Index: l.LastIndex() + 1,
 			Data:  v.Data,
@@ -178,8 +179,8 @@ func (l *RaftLog) leaderUpdateCommitted(N uint64) {
 // return whether accept the entries
 // index is the last index after appended the entries
 func (l *RaftLog) followerTryAppendLog(entries []pb.Entry, preLogIdx uint64, preLogTerm uint64) (accept bool, lastLogIndex uint64) {
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	accept = false
 	var startEntryIdx uint64
 	// check whether the preLogIndex is existed
@@ -271,8 +272,8 @@ func (l *RaftLog) maybeCompact() {
 // get the log entries leader should send to the follower
 // if the compacted = true, means the leader should send snapshot to that follower
 func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry, compacted bool) {
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	lastIdx := l.LastIndex()
 	if next > lastIdx {
 		return []pb.Entry{}, false
@@ -288,8 +289,8 @@ func (l *RaftLog) logEntriesAfterNext(next uint64) (ents []pb.Entry, compacted b
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	entryIdx, compacted := l.LogIdx2EntryIdx(l.stabled)
 	if !compacted || l.stabled == l.initIdx {
 		return l.entries[entryIdx+1:]
@@ -300,8 +301,8 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	l.Lock()
-	defer l.Unlock()
+	//l.Lock()
+	//defer l.Unlock()
 	// we do not need to worry about compacted, the appliedEntsIdx + 1 will be [0, appliedEntsIdx + 1]
 	appliedEntsIdx, _ := l.LogIdx2EntryIdx(l.applied)
 	committedEntsIdx, _ := l.LogIdx2EntryIdx(l.committed)

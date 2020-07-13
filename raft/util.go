@@ -139,6 +139,10 @@ func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
 
+func isSoftStateEqual(a, b *SoftState) bool {
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
+}
+
 func GetRandomBetween(min, max int) int {
 	if min >= max || min == 0 || max == 0 {
 		return max

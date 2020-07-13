@@ -100,44 +100,48 @@ func (d *peerMsgHandler) HandleRaftReady() {
 func (d *peerMsgHandler) handleAdminRequest(req *raft_cmdpb.RaftCmdRequest) {
 	switch req.AdminRequest.CmdType {
 	case raft_cmdpb.AdminCmdType_CompactLog:
-		// handle logGCCompact
-		// check whether need to be compacted
-		compactIdx := req.AdminRequest.CompactLog.CompactIndex
-		if d.peerStorage.applyState.TruncatedState.Index >= compactIdx {
-			log.Debugf("the log is already compacted")
-			return
-		}
-		log.Debugf("%s update compacted before, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
-		// update state
-		firstIdx := d.peerStorage.updateMetaByLogCompact(req)
-		// update memory log
-		d.RaftGroup.CompactMemoryLogEntries(req.AdminRequest.CompactLog.CompactIndex, req.AdminRequest.CompactLog.CompactTerm)
-		// assign a asynchronously task
-		d.ctx.raftLogGCTaskSender <- &runner.RaftLogGCTask{
-			RaftEngine: d.peerStorage.Engines.Raft,
-			RegionID:   d.regionId,
-			StartIdx:   firstIdx,
-			EndIdx:     compactIdx + 1,
-		}
-		log.Debugf("%s update compacted, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
-		// TODO seems this variable is useless
-		d.peer.LastCompactedIdx = compactIdx
-		log.Debugf("%s call Snapshot.", d.Tag)
-		snapshot, err := d.peerStorage.Snapshot()
-		if err == nil {
-			// update the LastSnapshot
-			// LastSnapshot only be updated when new snapshot index is greater than previous one
-			d.RaftGroup.UpdateLastSnapshot(&snapshot)
-			// if the generated snapshot is earlier than the compact, regenerating
-			if compactIdx > snapshot.Metadata.Index {
-				log.Debugf("%s call Snapshot.", d.Tag)
-				_, _ = d.peerStorage.Snapshot()
-			}
-		} else {
-			log.Errorf(" %s snapshot is still generating when executing compactLog command.", d.Tag)
-		}
-		log.Debugf("state after")
+		d.handleCompactLogMsg(req)
 	}
+}
+
+func (d *peerMsgHandler) handleCompactLogMsg(req *raft_cmdpb.RaftCmdRequest) {
+	// handle logGCCompact
+	// check whether need to be compacted
+	compactIdx := req.AdminRequest.CompactLog.CompactIndex
+	if d.peerStorage.applyState.TruncatedState.Index >= compactIdx {
+		log.Debugf("the log is already compacted")
+		return
+	}
+	log.Debugf("%s update compacted before, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
+	// update state
+	firstIdx := d.peerStorage.updateMetaByLogCompact(req)
+	// update memory log
+	d.RaftGroup.CompactMemoryLogEntries(req.AdminRequest.CompactLog.CompactIndex, req.AdminRequest.CompactLog.CompactTerm)
+	// assign a asynchronously task
+	d.ctx.raftLogGCTaskSender <- &runner.RaftLogGCTask{
+		RaftEngine: d.peerStorage.Engines.Raft,
+		RegionID:   d.regionId,
+		StartIdx:   firstIdx,
+		EndIdx:     compactIdx + 1,
+	}
+	log.Debugf("%s update compacted, [%s]", d.Tag, d.peerStorage.applyState.TruncatedState)
+	// TODO seems this variable is useless
+	d.peer.LastCompactedIdx = compactIdx
+	log.Debugf("%s call Snapshot.", d.Tag)
+	snapshot, err := d.peerStorage.Snapshot()
+	if err == nil {
+		// update the LastSnapshot
+		// LastSnapshot only be updated when new snapshot index is greater than previous one
+		d.RaftGroup.UpdateLastSnapshot(&snapshot)
+		// if the generated snapshot is earlier than the compact, regenerating
+		if compactIdx > snapshot.Metadata.Index {
+			log.Debugf("%s call Snapshot.", d.Tag)
+			_, _ = d.peerStorage.Snapshot()
+		}
+	} else {
+		log.Errorf(" %s snapshot is still generating when executing compactLog command.", d.Tag)
+	}
+	log.Debugf("state after")
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {

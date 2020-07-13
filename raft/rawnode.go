@@ -27,6 +27,11 @@ var ErrStepLocalMsg = errors.New("raft: cannot step raft local message")
 // but there is no peer found in raft.Prs for that node.
 var ErrStepPeerNotFound = errors.New("raft: cannot step as peer not found")
 
+// ErrAnotherConfChangePending is returned when there is already a conf change pending, and here comes another one
+var ErrAnotherConfChangePending = errors.New("raft: Fail to propose confChange, there already another one is processing. ")
+
+var ErrLeaderTransferring = errors.New("raft: cannot propose any command, because it currently transferring leadership. ")
+
 // SoftState provides state that is useful for logging and debugging.
 // The state is volatile and does not need to be persisted to the WAL.
 type SoftState struct {
@@ -74,6 +79,8 @@ type RawNode struct {
 	lastHardState pb.HardState
 	// only the ready() and advance() will modify it.
 	ReadyState bool
+	// lastSoftState
+	lastSoftState *SoftState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -83,6 +90,10 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	rn.Raft = newRaft(config)
 	rn.lastHardState = rn.Raft.currentHardState()
 	rn.ReadyState = true
+	rn.lastSoftState = &SoftState{
+		Lead:      rn.Raft.getCurrentLeader(),
+		RaftState: rn.Raft.getCurrentState(),
+	}
 	return rn, nil
 }
 
@@ -100,6 +111,10 @@ func (rn *RawNode) Campaign() error {
 
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
+	// TODO do not know whether really need this
+	if rn.Raft.leadTransferee > 0 {
+		return ErrLeaderTransferring
+	}
 	ent := pb.Entry{Data: data}
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
@@ -109,6 +124,11 @@ func (rn *RawNode) Propose(data []byte) error {
 
 // ProposeConfChange proposes a config change.
 func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
+	// if there is already another conf change is processing
+	// we should not continue propose
+	if !rn.Raft.checkPendingConfChangeIdx() {
+		return ErrAnotherConfChangePending
+	}
 	data, err := cc.Marshal()
 	if err != nil {
 		return err
@@ -163,12 +183,21 @@ func (rn *RawNode) Ready() Ready {
 		// if changed, put it to ready, and replace the lastHardState with currentHardState
 		hs = currentHardState
 	}
+	var ss *SoftState
+	curSoftSt := &SoftState{
+		Lead:      rn.Raft.getCurrentLeader(),
+		RaftState: rn.Raft.getCurrentState(),
+	}
+	if !isSoftStateEqual(curSoftSt, rn.lastSoftState) {
+		ss = curSoftSt
+		rn.lastSoftState = curSoftSt
+	}
 	var readySnap pb.Snapshot
 	snapshot := rn.Raft.getPendingSnapshot()
 	if !IsEmptySnap(snapshot) {
 		// if has pending snapshot
 		readySnap = *snapshot
-		log.Debugf("[%d] has snapshot",rn.Raft.id)
+		log.Debugf("[%d] has snapshot", rn.Raft.id)
 	} else {
 		readySnap = pb.Snapshot{}
 		//log.Debugf("[%d] no snapshot",rn.Raft.id)
@@ -180,6 +209,7 @@ func (rn *RawNode) Ready() Ready {
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 		Snapshot:         readySnap,
+		SoftState:        ss,
 	}
 }
 
