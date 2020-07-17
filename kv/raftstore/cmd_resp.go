@@ -60,3 +60,15 @@ func newCmdResp() *raft_cmdpb.RaftCmdResponse {
 		Header: &raft_cmdpb.RaftResponseHeader{},
 	}
 }
+
+func raftAdminCmdResponse(adminRes *raft_cmdpb.AdminResponse, currentTerm uint64, uuid []byte) *raft_cmdpb.RaftCmdResponse {
+	responseHeader := new(raft_cmdpb.RaftResponseHeader)
+	responseHeader.CurrentTerm = currentTerm
+	if uuid != nil && len(uuid) > 0 {
+		responseHeader.Uuid = uuid
+	}
+	cmdResponse := new(raft_cmdpb.RaftCmdResponse)
+	cmdResponse.Header = responseHeader
+	cmdResponse.AdminResponse = adminRes
+	return cmdResponse
+}

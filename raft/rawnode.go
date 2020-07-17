@@ -134,10 +134,16 @@ func (rn *RawNode) ProposeConfChange(cc pb.ConfChange) error {
 		return err
 	}
 	ent := pb.Entry{EntryType: pb.EntryType_EntryConfChange, Data: data}
-	return rn.Raft.Step(pb.Message{
+	err = rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
 		Entries: []*pb.Entry{&ent},
 	})
+	if err != nil {
+		return err
+	}
+	// update the pending conf Index
+	rn.Raft.PendingConfIndex = rn.Raft.RaftLog.LastIndex()
+	return nil
 }
 
 // ApplyConfChange applies a config change to the local node.
@@ -243,9 +249,9 @@ func (rn *RawNode) Advance(rd Ready) {
 	rn.Raft.finishStablePendingSnapshot()
 }
 
-func (rn *RawNode) UpdateLastSnapshot(snapshot *pb.Snapshot) {
-	rn.Raft.UpdateLastSnapshot(snapshot)
-}
+//func (rn *RawNode) UpdateLastSnapshot(snapshot *pb.Snapshot) {
+//	rn.Raft.UpdateLastSnapshot(snapshot)
+//}
 
 // GetProgress return the the Progress of this node and its peers, if this
 // node is leader.

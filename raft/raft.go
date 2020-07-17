@@ -299,27 +299,29 @@ func (r *Raft) sendSnapshotMsg(to, nxtIdx uint64) (*pb.Message, error) {
 		Term:    r.Term,
 	}
 	// if current cached snapshot not satisfied the requirement
-	if !r.IsLastSnapshotOkForSending(nxtIdx) {
-		for {
-			log.Debugf("%d call Snapshot.", r.id)
-			snapshot, err := r.RaftLog.storage.Snapshot()
-			if err == nil {
-				r.UpdateLastSnapshot(&snapshot)
-				break
+	// TODO snapshot optimize
+	//if !r.IsLastSnapshotOkForSending(nxtIdx) {
+	for {
+		log.Debugf("%d call Snapshot.", r.id)
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err == nil {
+			msg.Snapshot = &snapshot
+			//r.UpdateLastSnapshot(&snapshot)
+			break
+		} else {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				// if the log is not ready, take a break
+				time.Sleep(10 * time.Millisecond)
+				continue
 			} else {
-				if err == ErrSnapshotTemporarilyUnavailable {
-					// if the log is not ready, take a break
-					time.Sleep(15 * time.Second)
-					continue
-				} else {
-					// TODO is this a good idea to panic here ?
-					log.Errorf("leader try generated snapshot and fail too many times.")
-					return nil, err
-				}
+				// TODO is this a good idea to panic here ?
+				log.Errorf("leader try generated snapshot and fail too many times.")
+				return nil, err
 			}
 		}
 	}
-	msg.Snapshot = r.GetLastSnapshot()
+	//}
+	//msg.Snapshot = r.GetLastSnapshot()
 	return msg, nil
 }
 
@@ -432,7 +434,7 @@ func (r *Raft) handleAppendResponse(m pb.Message) (shouldResend bool) {
 			// make sure the leadTransferee is set 0
 			// although we already add this line in cleanState(),
 			// but it does not hurt anything, right?
-			r.leadTransferee = 0
+			//r.leadTransferee = 0
 			return
 		}
 	}
@@ -516,7 +518,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 	}
 	preTerm, err := r.RaftLog.Term(preIdx)
 	if err != nil {
-		log.Errorf("Fail to get Term of Log Index (%d), Error: %s", preIdx, err.Error())
+		log.Warnf("Fail to get Term of Log Index (%d), try Send snapshot, Error: %s", preIdx, err.Error())
 		preIdx = r.RaftLog.LastIndex()
 		preTerm, _ = r.RaftLog.Term(preIdx)
 	}
@@ -838,7 +840,7 @@ func (r *Raft) handleLeaderTransfer(m pb.Message) {
 		// up-to-date
 		// let the chosen one start a new election
 		r.sendTimeoutNow(r.leadTransferee)
-		r.leadTransferee = 0
+		//r.leadTransferee = 0
 	} else {
 		// lag behind
 		// we need to make the chosen one keep up with leader
@@ -1064,26 +1066,33 @@ func (r *Raft) setPendingSnapshot(snapshot *pb.Snapshot) {
 	r.RaftLog.pendingSnapshot = snapshot
 }
 
-func (r *Raft) GetLastSnapshot() *pb.Snapshot {
-	return r.RaftLog.lastSnapshot
-}
-
-func (r *Raft) UpdateLastSnapshot(snapshot *pb.Snapshot) {
-	if r.RaftLog.lastSnapshot == nil {
-		r.RaftLog.lastSnapshot = snapshot
-		return
-	}
-	if r.RaftLog.lastSnapshot.Metadata.Index < snapshot.Metadata.Index {
-		r.RaftLog.lastSnapshot = snapshot
-	}
-}
-
-func (r *Raft) IsLastSnapshotOkForSending(needLogIdx uint64) bool {
-	if r.RaftLog.lastSnapshot == nil {
-		return false
-	}
-	return r.RaftLog.lastSnapshot.Metadata.Index >= needLogIdx
-}
+// TODO snapshot optimize
+//func (r *Raft) GetLastSnapshot() *pb.Snapshot {
+//	return r.RaftLog.lastSnapshot
+//}
+//
+//func (r *Raft) UpdateLastSnapshot(snapshot *pb.Snapshot) {
+//	if r.RaftLog.lastSnapshot == nil {
+//		r.RaftLog.lastSnapshot = snapshot
+//		return
+//	}
+//	if r.RaftLog.lastSnapshot.Metadata.Index < snapshot.Metadata.Index {
+//		r.RaftLog.lastSnapshot = snapshot
+//	}
+//}
+//
+//func (r *Raft) IsLastSnapshotOkForSending(needLogIdx uint64) bool {
+//	if r.GetLastSnapshot() == nil {
+//		return false
+//	}
+//	// change membership
+//	curNs := nodes(r)
+//	if r.GetLastSnapshot().Metadata.Index < needLogIdx || len(curNs) != len(r.GetLastSnapshot().Metadata.ConfState.Nodes) {
+//		log.Errorf("discard last snapshot")
+//		return false
+//	}
+//	return true
+//}
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {

@@ -131,6 +131,20 @@ func CheckRegionEpoch(req *raft_cmdpb.RaftCmdRequest, region *metapb.Region, inc
 	return nil
 }
 
+// deep copy the meta data of origin region
+func DeepCopyRegionInfo(oldRegion *metapb.Region) (*metapb.Region, error) {
+	newRegion := new(metapb.Region)
+	var data []byte
+	var err error
+	if data, err = oldRegion.Marshal(); err != nil {
+		return nil, err
+	}
+	if err = newRegion.Unmarshal(data); err != nil {
+		return nil, err
+	}
+	return newRegion, nil
+}
+
 func FindPeer(region *metapb.Region, storeID uint64) *metapb.Peer {
 	for _, peer := range region.Peers {
 		if peer.StoreId == storeID {

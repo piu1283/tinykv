@@ -376,10 +376,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.region.EndKey = snapData.Region.EndKey
 	ps.region.RegionEpoch = snapData.Region.RegionEpoch
 	ps.region.Peers = snapData.Region.Peers
-	regionLocalState := rspb.RegionLocalState{
-		State:  rspb.PeerState_Normal,
-		Region: ps.region,
-	}
+	state, _ := meta.GetRegionLocalState(ps.Engines.Kv, ps.region.Id)
 	// clear the metadata
 	if err := ps.clearMeta(kvWB, raftWB); err != nil {
 		return res, err
@@ -391,9 +388,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
 		return res, err
 	}
-	if err := kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), &regionLocalState); err != nil {
-		return res, err
-	}
+	meta.WriteRegionState(kvWB, ps.region, state.State)
 	ps.snapState.StateType = snap.SnapState_Applying
 	// clean stale extra data
 	ps.clearExtraData(snapData.Region)
@@ -414,7 +409,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return res, nil
 }
 
-// TODO check it
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
@@ -449,7 +443,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 	// update raftState,
 	if err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
-		return nil, err
+		return applyRes, err
 	}
 	// execute the write of raftDB
 	if err = raftWB.WriteToDB(ps.Engines.Raft); err != nil {
