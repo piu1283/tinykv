@@ -357,6 +357,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				}
 				if err := d.RaftGroup.ProposeConfChange(*confChange); err != nil {
 					log.Warnf("Fail to propose conf change.", msg, err)
+					cb.Done(ErrResp(err))
 					return
 				}
 			case raft_cmdpb.AdminCmdType_Split:
