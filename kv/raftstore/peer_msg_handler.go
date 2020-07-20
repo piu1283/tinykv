@@ -88,7 +88,11 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					log.Errorf("fail to unmarshal data to confChange. [%s]", err.Error())
 					return
 				}
-				cmdResponse = d.handleConfChange(confChangeReq)
+				var needEnd bool
+				cmdResponse, needEnd = d.handleConfChange(confChangeReq)
+				if needEnd {
+					return
+				}
 			default:
 				// handle normal Entry, including compactLog which is an admin request
 				req := new(raft_cmdpb.RaftCmdRequest)
@@ -136,7 +140,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 }
 
-func (d *peerMsgHandler) handleConfChange(cc *eraftpb.ConfChange) *raft_cmdpb.RaftCmdResponse {
+func (d *peerMsgHandler) handleConfChange(cc *eraftpb.ConfChange) (*raft_cmdpb.RaftCmdResponse, bool) {
 	// update region meta
 	cpRes := new(raft_cmdpb.ChangePeerResponse)
 	adminResponse := &raft_cmdpb.AdminResponse{
@@ -147,11 +151,11 @@ func (d *peerMsgHandler) handleConfChange(cc *eraftpb.ConfChange) *raft_cmdpb.Ra
 	cxt := new(kvrpcpb.Context)
 	if err := cxt.Unmarshal(cc.Context); err != nil {
 		log.Errorf("fail to unmarshal kvrpcpb.context. [%s]", err.Error())
-		return ErrResp(err)
+		return ErrResp(err),true
 	}
 	if cxt.RegionEpoch.ConfVer <= d.peerStorage.region.RegionEpoch.ConfVer {
 		log.Warnf("Conf Change already updated, version:[%d]， curConfVer[%d]", cxt.RegionEpoch.ConfVer, d.Region().RegionEpoch.ConfVer)
-		return raftAdminCmdResponse(adminResponse, d.Term(), nil)
+		return raftAdminCmdResponse(adminResponse, d.Term(), nil) ,false
 	}
 	// update the ConfVer
 	d.peerStorage.region.RegionEpoch.ConfVer = cxt.RegionEpoch.ConfVer
@@ -167,7 +171,7 @@ func (d *peerMsgHandler) handleConfChange(cc *eraftpb.ConfChange) *raft_cmdpb.Ra
 			log.Debugf("destroy myself. regionId:[%d], storeId[%d].", d.regionId, d.storeID())
 			d.destroyPeer()
 			cpRes.Region = d.peerStorage.region
-			return raftAdminCmdResponse(adminResponse, d.Term(), nil)
+			return raftAdminCmdResponse(adminResponse, d.Term(), nil), true
 		}
 		pIdx := -1
 		for i, v := range d.peerStorage.region.Peers {
@@ -187,7 +191,7 @@ func (d *peerMsgHandler) handleConfChange(cc *eraftpb.ConfChange) *raft_cmdpb.Ra
 	meta.WriteRegionState(kvWB, d.peerStorage.region, rspb.PeerState_Normal)
 	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 	d.peer.RaftGroup.ApplyConfChange(*cc)
-	return raftAdminCmdResponse(adminResponse, d.Term(), nil)
+	return raftAdminCmdResponse(adminResponse, d.Term(), nil), false
 }
 
 // handle leader transfer admin msg
@@ -353,6 +357,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				confChange, err := d.generateConfChange(msg)
 				if err != nil {
 					log.Error("Fail to construct conf change.", msg, err)
+					cb.Done(ErrResp(err))
 					return
 				}
 				if err := d.RaftGroup.ProposeConfChange(*confChange); err != nil {
@@ -369,16 +374,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				}
 				if err := d.RaftGroup.Propose(data); err != nil {
 					log.Error("Fail to propose request.", msg, err)
+					cb.Done(ErrResp(err))
 				}
 			case raft_cmdpb.AdminCmdType_CompactLog:
 				if err := d.RaftGroup.Propose(data); err != nil {
 					log.Error("Fail to propose request.", msg, err)
+					cb.Done(ErrResp(err))
 				}
 			}
 		} else {
 			// the propose request is normal operation
 			if err := d.RaftGroup.Propose(data); err != nil {
 				log.Error("Fail to propose request.", msg, err)
+				cb.Done(ErrResp(err))
 			}
 		}
 		propo := &proposal{
